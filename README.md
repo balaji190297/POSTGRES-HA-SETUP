@@ -22,4 +22,3 @@ Production-grade High Availability setup using:
 
 ---
 
-## 🏗 Architecture
