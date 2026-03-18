@@ -1,0 +1,679 @@
+🔥 **PostgreSQL High Availability: Building a Self-Healing PostgreSQL 17 Cluster (Step-by-Step)**
+
+Most database outages don’t happen because of bugs.
+They happen because **failover and recovery weren’t automated.**
+
+Recently I built a **production-ready PostgreSQL HA cluster** using:
+
+• PostgreSQL 17
+• TimescaleDB
+• repmgr
+• Keepalived
+• VIP based failover + automatic node recovery
+
+Goal of this architecture:
+
+✅ Automatic failover
+✅ Zero application connection change (VIP)
+✅ Automatic failed node rejoin
+✅ Fully automated cluster recovery
+
+---
+
+# 🏗 Architecture
+
+```
+Client Applications
+        |
+   Virtual IP (VIP)
+     Keepalived
+        |
+----------------------------
+|                          |
+TIMESCALEDBM01         TIMESCALEDBM02
+   PRIMARY                STANDBY
+ PostgreSQL 17          PostgreSQL 17
+  TimescaleDB            TimescaleDB
+    repmgrd               repmgrd
+        \                  /
+         ---- WAL STREAM ---
+```
+
+Applications connect only to the **VIP**, so failover is transparent.
+
+|-----------------------------------------------------|
+     POSTGRESQL DB - INSTALLATION & CONFIGURATION
+|-----------------------------------------------------|
+# ⚙️ Step 1 — Prepare Both Nodes
+
+Set hostname.
+
+Primary
+----> sudo hostnamectl set-hostname DB01
+Standby
+----> sudo hostnamectl set-hostname DB02
+
+Update `/etc/hosts` on both nodes
+
+xxx.xxx.xxx.xxx  DB01
+xxx.xxx.xxx.xxx  DB02
+------------------------------------------------------|
+# ⚙️ Step 2 — Install PostgreSQL 17
+
+Add PostgreSQL repository.
+----> sudo apt update
+----> sudo apt install -y curl gnupg2 lsb-release
+Add repo key
+----> curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
+----> sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+Add repository
+----> echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] \
+http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+----> sudo tee /etc/apt/sources.list.d/pgdg.list
+Install PostgreSQL
+----> sudo apt update
+----> sudo apt install -y postgresql-17 postgresql-client-17
+-----------------------------------------------------------------------------------|
+# ⚙️ Step 3 — Install Extensions
+Install required packages.
+----> sudo apt install -y timescaledb-2-postgresql-17 repmgr
+Add TimescaleDB repository if needed.
+-----------------------------------------------------------------------------------|
+# ⚙️ Step 4 — Configure PostgreSQL
+
+Move database directory.
+----> sudo mkdir -p /db/data
+----> sudo chown -R postgres:postgres /db
+----> sudo chmod 700 /db/data
+
+Initialize database cluster.
+----> sudo -u postgres /usr/lib/postgresql/17/bin/initdb \
+-D /db/data \
+--data-checksums 
+
+## PostgreSQL Configuration Highlights
+
+Edit
+/etc/postgresql/17/main/postgresql.conf
+
+Important parameters:
+-Edit /etc/postgresql/17/main/postgresql.conf for cluster primary startup and register (same config for both nodes)
+
+data_directory = '/db/data'            # use data in another directory
+hba_file = '/etc/postgresql/17/main/pg_hba.conf'        # host-based authentication file
+ident_file = '/etc/postgresql/17/main/pg_ident.conf'    # ident configuration file
+external_pid_file = '/var/run/postgresql/17-main.pid'                   # write an extra PID file
+listen_addresses = '*'          # what IP address(es) to listen on;
+port = 5432                             # (change requires restart)
+max_connections = 500                   # (change requires restart)
+unix_socket_directories = '/var/run/postgresql/' # comma-separated list of directories
+shared_buffers = 64GB                   # min 128kB
+temp_buffers = 256MB                    # min 800kB
+work_mem = 128MB                                # min 64kB
+maintenance_work_mem = 8GB              # min 64kB
+dynamic_shared_memory_type = posix      # the default is usually the first option
+effective_io_concurrency = 256          # 1-1000; 0 disables prefetching
+max_worker_processes = 100              # (change requires restart)
+max_parallel_workers_per_gather = 32    # limited by max_parallel_workers
+max_parallel_workers = 64               # number of max_worker_processes that
+wal_level = replica                     # minimal, replica, or logical
+fsync = on                              # flush data to disk for crash safety
+synchronous_commit = remote_write               # synchronization level;
+full_page_writes = on                   # recover from partial page writes
+wal_log_hints = on                      # also do full page writes of non-critical updates
+wal_compression = zstd                  # enables compression of full-page writes;
+wal_buffers = 64MB                      # min 32kB, -1 sets based on shared_buffers
+checkpoint_timeout = 15min              # range 30s-1d
+checkpoint_completion_target = 0.9      # checkpoint target duration, 0.0 - 1.0
+max_wal_size = 64GB
+min_wal_size = 4GB
+archive_mode = on               # enables archiving; off, on, or always
+archive_command = 'zstd -q -3 %p -o /nfs/archive/%f.zst'                # command to use to archive a WAL file
+archive_timeout = 60            # force a WAL file switch after this
+restore_command = '[ -f /nfs/archive/%f.zst ] && zstd -d /nfs/archive/%f.zst -c > %p || exit 1'
+max_wal_senders = 10            # max number of walsender processes
+max_replication_slots = 10      # max number of replication slots
+wal_keep_size = 20GB            # in megabytes; 0 disables
+synchronous_standby_names = '*' # standby servers that provide sync rep
+hot_standby = on                        # "off" disallows queries during recovery
+random_page_cost = 4.0                  # same scale as above
+parallel_setup_cost = 1000.0            # same scale as above
+parallel_tuple_cost = 0.1               # same scale as above
+effective_cache_size = 192GB
+default_statistics_target = 100 # range 1-10000
+jit = off                               # allow JIT compilation
+logging_collector = on          # Enable capturing of stderr, jsonlog,
+log_directory = '/db/log'                      # directory where log files are written,
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log' # log file name pattern,
+log_rotation_age = 1d                   # Automatic rotation of logfiles will
+log_rotation_size = 1GB         # Automatic rotation of logfiles will
+log_min_error_statement = 'error'       # values in order of decreasing detail:
+log_line_prefix = '%m [%p] %q%u@%d '            # special values:
+log_lock_waits = 'on'                   # log lock waits >= deadlock_timeout
+log_statement = 'mod'                   # none, ddl, mod, all
+log_timezone = 'Etc/UTC'
+cluster_name = '17/main'                        # added to process titles if nonempty
+autovacuum_max_workers = 10             # max number of autovacuum subprocesses
+autovacuum_naptime = 10         # time between autovacuum runs
+default_toast_compression = lz4 # 'pglz' or 'lz4'
+datestyle = 'iso, mdy'
+timezone = 'Etc/UTC'
+lc_messages = 'en_US.UTF-8'             # locale for system error message
+lc_monetary = 'en_US.UTF-8'             # locale for monetary formatting
+lc_numeric = 'en_US.UTF-8'              # locale for number formatting
+lc_time = 'en_US.UTF-8'                 # locale for time formatting
+default_text_search_config = 'pg_catalog.english'
+shared_preload_libraries = 'repmgr, timescaledb, pg_cron'
+cron.database_name = 'marketdata'
+max_locks_per_transaction = 1024                # min 10
+include_dir = 'conf.d'                  # include files ending in '.conf' from
+timescaledb.last_tuned = '2025-09-10T20:40:19+05:30'
+timescaledb.last_tuned_version = '0.18.0'
+timescaledb.max_background_workers = 64
+_______________________________________________________________________________________
+Create required directories:
+
+FOR Archive need to use nfs for archive availability in across all nodes in cluster(archive will happens only at primary )
+
+mkdir /nfs/archive
+mkdir /db/log
+---------------------------------------------------------------------------------------------|
+
+# ⚙️ Step 5 — Configure Authentication
+
+Edit `pg_hba.conf`
+host  replication  repmgr  xxx.xxx.xxx.xxx/24  scram-sha-256
+host  repmgr       repmgr  xxx.xxx.xxx.xxx/24  scram-sha-256
+
+Restart database.
+----> systemctl restart postgresql@17-main
+---------------------------------------------------------------------------------------------|
+# ⚙️ Step 6 — Create repmgr User
+----> sudo -u postgres psql
+
+----> CREATE ROLE repmgr LOGIN SUPERUSER PASSWORD 'StrongPassword';
+----> CREATE DATABASE repmgr OWNER repmgr;
+----------------------------------------------------------------------------------------------|
+# ⚙️ Step 7 — Configure repmgr (same config for both nodes)
+
+Create config file:
+/etc/postgresql/17/main/repmgr.conf
+
+node_id=1
+node_name=DBM01
+conninfo='host=DB01 user=repmgr dbname=repmgr connect_timeout=2'
+data_directory='/db/data'
+log_level=INFO
+log_file='/var/log/repmgr/repmgr.log'
+log_status_interval=2
+pg_bindir='/usr/lib/postgresql/17/bin'
+ssh_options='-q -o ConnectTimeout=10'
+use_replication_slots=true
+connection_check_type='ping'
+monitoring_history=true
+failover= automatic
+promote_command='/usr/bin/repmgr -f /etc/postgresql/17/main/repmgr.conf standby promote --log-to-file'
+follow_command='/usr/bin/repmgr -W -f /etc/postgresql/17/main/repmgr.conf standby follow --log-to-file --upstream-node-id=%n'
+primary_visibility_consensus=true
+repmgrd_service_start_command='sudo /usr/bin/systemctl start repmgrd.service'
+repmgrd_service_stop_command='sudo /usr/bin/systemctl stop repmgrd.service'
+service_start_command='sudo /usr/bin/systemctl start postgresql@17-main.service'
+service_stop_command='sudo /usr/bin/systemctl stop postgresql@17-main.service'
+service_restart_command='sudo /usr/bin/systemctl restart postgresql@17-main.service'
+service_reload_command='sudo /usr/bin/systemctl reload postgresql@17-main.service'
+reconnect_attempts=3
+reconnect_interval=3
+standby_reconnect_timeout=10
+node_rejoin_timeout=10
+________________________________________________________________________________________________
+On any one node Register as primary.
+
+----> sudo -u postgres repmgr -f /etc/postgresql/17/main/repmgr.conf primary register
+-----------------------------------------------------------------------------------------------------------------------------------|
+# ⚙️ Step 8 — Create Standby Node - On second node
+
+Stop postgres.
+
+----> systemctl stop postgresql@17-main
+_______________________________________________
+Clean data directory.
+----> rm -rf /db/data
+______________________
+Clone standby from primary.
+
+----> sudo -u postgres repmgr -f /etc/postgresql/17/main/repmgr.conf   -h DBM01 -U repmgr -d repmgr standby clone --fast-checkpoint
+___________________________________________
+Start database.
+----> systemctl start postgresql@17-main
+___________________________________________
+Register standby.
+----> sudo -u postgres repmgr -f /etc/postgresql/17/main/repmgr.conf standby register -F
+-------------------------------------------------------------------------------------------------------------------------------------|
+
+# ⚙️ Step 9 — Enable repmgr Daemon (On both nodes)
+
+----> systemctl enable repmgrd
+----> systemctl start repmgrd
+________________________________________
+Verify cluster.
+---->sudo -u postgres repmgr -f /etc/postgresql/17/main/repmgr.conf cluster show
+
+Example output:
+
+ ID | Name           | Role    | Status    | Upstream       | Location | Priority | Timeline | Connection string
+----+----------------+---------+-----------+----------------+----------+----------+----------+-----------------------------------------------------------------
+ 1  | DB01 | primary | * running |                | default  | 100      | 26       | host=DB01 user=repmgr dbname=repmgr connect_timeout=2
+ 2  | DB02 | standby |   running | DB01 | default  | 100      | 26       | host=DB02 user=repmgr dbname=repmgr connect_timeout=2
+
+-----------------------------------------------------------------------------------------------------------------------------------|
+🔀 Step 10 — Automatic Failover with Keepalived
+
+INSTALL Keepalived
+
+----> apt install keepalived (on both nodes)
+________________________________________________________
+Clients connect to a **Virtual IP**.
+create config in /etc/keepalived/keepalived.conf
+
+global_defs {
+    script_security
+}
+
+
+vrrp_script chk_postgres {
+    script "/etc/keepalived/chk_postgres.sh"
+    interval 3
+    fall 2
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface br0                  # adjust to your network interface
+    virtual_router_id 51
+    priority 100                    # higher priority than standby
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    virtual_ipaddress {
+        xxx.xxx.xxx.xxx/24 dev eth0  # VIP for client connections
+    }
+    track_script {
+        chk_postgres
+    }
+    notify "/etc/keepalived/notify.sh"
+}
+_____________________________________________________________________________________
+create notify.sh and chk_postgre.sh in same folder
+
+chk_postgres.sh
+
+#!/bin/bash
+# Health check for Keepalived VIP in a PostgreSQL + repmgr cluster
+# Works for both primary and standby nodes
+
+set -e
+
+# PostgreSQL / repmgr config
+PG_OS_USER=postgres
+PG_USER=repmgr
+PG_PORT=5432
+PG_DB=repmgr
+REPMGR_CONF="/etc/postgresql/17/main/repmgr.conf"
+
+# Detect host IP (or hardcode your primary interface IP)
+PG_HOST=$(hostname -I | awk '{print $1}')
+
+# --------------------------------------------
+# 1️⃣ Check if PostgreSQL is accepting connections
+# --------------------------------------------
+sudo -u $PG_OS_USER pg_isready -h "$PG_HOST" -p $PG_PORT -U $PG_USER -d $PG_DB > /dev/null 2>&1
+if [ $? -ne 0 ]; then
+    echo "PostgreSQL not ready"
+    exit 1
+fi
+
+# --------------------------------------------
+# 2️⃣ Check if this node is primary via pg_is_in_recovery()
+# --------------------------------------------
+IS_PRIMARY=$(sudo -u $PG_OS_USER psql -h "$PG_HOST" -p $PG_PORT -U $PG_USER -d $PG_DB -t -c "SELECT pg_is_in_recovery();")
+IS_PRIMARY=$(echo "$IS_PRIMARY" | xargs)
+
+# true = standby, false = primary
+if [[ "$IS_PRIMARY" == "f" ]]; then
+    NODE_ROLE="primary"
+else
+    NODE_ROLE="standby"
+fi
+
+# --------------------------------------------
+# 3️⃣ Get actual primary node from repmgr cluster
+# Only consider nodes that are primary AND running (*)
+# --------------------------------------------
+PRIMARY_NODE=$(sudo -u $PG_OS_USER repmgr -f "$REPMGR_CONF" cluster show \
+    | awk -F'|' '$3 ~ /primary/ && $4 ~ /\*/ {print $2}' | xargs)
+
+# Local hostname
+NODE_NAME=$(hostname -s | xargs)
+
+# Normalize names: strip domain suffix if present
+NODE_NAME=${NODE_NAME%%.*}
+PRIMARY_NODE=${PRIMARY_NODE%%.*}
+
+# --------------------------------------------
+# 4️⃣ Output and exit code
+# --------------------------------------------
+echo "NODE_ROLE=$NODE_ROLE, Primary node is $PRIMARY_NODE, current node is $NODE_NAME ($NODE_ROLE)"
+
+if [[ "$NODE_NAME" == "$PRIMARY_NODE" ]]; then
+    # Current node is primary
+    exit 0
+else
+    # Current node is standby
+    exit 1
+fi
+-------------------------------
+ notify.sh
+
+#!/bin/bash
+# Keepalived notification script
+
+TYPE=$1
+NAME=$2
+STATE=$3
+
+LOGFILE="/var/log/keepalived-vip.log"
+PG_OS_USER=postgres
+PG_HOST=$(hostname -I | awk '{print $1}')
+#PG_HOST=192.168.4.220
+PG_PORT=5432
+PG_USER=repmgr
+PG_DB=repmgr
+REPMGR_CONF="/etc/postgresql/17/main/repmgr.conf"
+
+# Function to log cluster status
+get_cluster_status() {
+    echo "Cluster status at $(date '+%F %T'):" >> $LOGFILE
+    sudo -u $PG_OS_USER repmgr -h $PG_HOST -f $REPMGR_CONF cluster show >> $LOGFILE
+    echo "----------------------------------------" >> $LOGFILE
+}
+
+case $STATE in
+    MASTER)
+        echo "$(date '+%F %T') - ${NAME} is now MASTER on $(hostname)" >> $LOGFILE
+        get_cluster_status
+        ;;
+    BACKUP)
+        echo "$(date '+%F %T') - ${NAME} is now BACKUP on $(hostname)" >> $LOGFILE
+        get_cluster_status
+        ;;
+    FAULT)
+        echo "$(date '+%F %T') - ${NAME} entered FAULT state on $(hostname)" >> $LOGFILE
+        get_cluster_status
+        ;;
+    *)
+        echo "$(date '+%F %T') - ${NAME} unknown state ${STATE} on $(hostname)" >> $LOGFILE
+        get_cluster_status
+        ;;
+esac
+
+__________________________________________________________________________________________________
+
+
+
+Health check verifies:
+
+1️⃣ PostgreSQL availability
+2️⃣ Whether node is primary
+3️⃣ Cluster state via repmgr
+
+Restart keepalived after creating above files on both node one by one
+
+VIP moves automatically when failover occurs.
+---------------------------------------------------------------------------------------------------------|
+# 🔄 Step 11 — Automatic Node Recovery
+
+One common problem with PostgreSQL HA is **reintegrating failed nodes**.
+
+To solve this, I built an **automated rejoin system** using a timer service.
+
+Workflow:
+
+1️⃣ Detect node failure
+2️⃣ Attempt **pg_rewind rejoin**
+
+```
+repmgr node rejoin --force-rewind
+```
+
+3️⃣ If rewind fails → restore missing WAL from archive
+4️⃣ If still failing → perform **full reclone**
+
+```
+repmgr standby clone
+```
+
+This makes the cluster **self-healing**.
+
+Create repmgr-auto-rejoin.sh for both nodes and configure REPMGR_CONN &CLONE_HOST vice-versa.
+
+#!/bin/bash
+set -uo pipefail
+
+# ------------------ Logging & Lock ------------------ #
+exec >> /var/log/repmgr-auto-rejoin.log 2>&1
+
+LOCK_FILE="/tmp/repmgr-auto-rejoin.lock"
+exec 200>$LOCK_FILE
+flock -n 200 || {
+  echo "[INFO] Another instance is already running. Exiting."
+  exit 0
+}
+
+# ------------------ Configuration ------------------ #
+REPMGR_CONF="/etc/postgresql/17/main/repmgr.conf"
+REPMGR_CONN="host=DB02 user=repmgr dbname=repmgr connect_timeout=2"
+PGDATA="/db/data"
+CLONE_HOST="DB02"
+ARCHIVE_DIR="/nfs/archive"
+BACKUP_DIR="${PGDATA}_bak_$(date +%Y%m%d_%H%M%S)"
+PGSERVICE="postgresql@17-main.service"
+
+NODE_NAME=$(grep -E "^node_name" "$REPMGR_CONF" | awk -F= '{print $2}' | xargs)
+
+# ------------------ Functions ------------------ #
+
+wait_for_postgres_ready() {
+  echo "[INFO] Waiting for PostgreSQL to finish recovery..."
+  local timeout=900 # 15 minutes
+  local elapsed=0
+
+  while true; do
+    if sudo -u postgres psql -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
+      echo "[INFO] PostgreSQL is accepting queries."
+      return 0
+    fi
+    sleep 5
+    elapsed=$((elapsed+5))
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo "[ERROR] PostgreSQL did not become ready within $timeout seconds."
+      return 1
+    fi
+  done
+}
+
+get_cluster_status() {
+  sudo -u postgres repmgr -f "$REPMGR_CONF" cluster show | awk -v node="$NODE_NAME" '
+    BEGIN {FS="|"}
+    $2 ~ node {gsub(/^[ \t]+|[ \t]+$/, "", $4); print $4}
+  '
+}
+
+try_rejoin() {
+  echo "[INFO] Attempting pg_rewind rejoin..."
+
+  if systemctl is-active --quiet "$PGSERVICE"; then
+    echo "[INFO] Stopping PostgreSQL before pg_rewind..."
+    systemctl stop "$PGSERVICE"
+  fi
+
+  local attempt=1
+  local max_attempts=10
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    echo "[INFO] pg_rewind attempt #$attempt"
+
+    # Capture exit code of rejoin
+    set +e
+    sudo -u postgres repmgr -f "$REPMGR_CONF" node rejoin -d "$REPMGR_CONN" --force-rewind --verbose
+    local exit_code=$?
+    set -e
+
+    if [ $exit_code -eq 0 ]; then
+      echo "[INFO] repmgr report success."
+      break
+    fi
+
+    # Check if failure was just a missing WAL file
+    missing_wal=$(sudo -u postgres /usr/lib/postgresql/17/bin/pg_rewind -D "$PGDATA" --source-server="$REPMGR_CONN" --dry-run 2>&1 | \
+      grep "could not open file" | sed -E 's/.*pg_wal\/([^"]+)".*/\1/')
+
+    if [ -n "$missing_wal" ]; then
+      echo "[WARN] Missing WAL: $missing_wal. Restoring from archive..."
+      archive_file="$ARCHIVE_DIR/$missing_wal.zst"
+      if [ -f "$archive_file" ]; then
+        sudo -u postgres zstd -d -f "$archive_file" -o "$PGDATA/pg_wal/$missing_wal"
+        chown postgres:postgres "$PGDATA/pg_wal/$missing_wal"
+        ((attempt++))
+        continue
+      fi
+    fi
+
+    echo "[INFO] Rejoin command finished/timed out. Checking if PG is recovering..."
+    break
+  done
+
+  # CRITICAL: Even if repmgr failed, PG might be starting up fine.
+  systemctl start "$PGSERVICE"
+  if wait_for_postgres_ready; then
+    sleep 10 # Give repmgrd a moment to update metadata
+    local status=$(get_cluster_status)
+    if [[ "$status" == "running" ]]; then
+      echo "[SUCCESS] Node is active in cluster. No reclone needed."
+      return 0
+    fi
+  fi
+
+  echo "[ERROR] Node failed to reach 'running' status after rejoin attempt."
+  return 1
+}
+
+do_clone() {
+  echo "[WARN] Performing full reclone from $CLONE_HOST..."
+  systemctl stop "$PGSERVICE" || true
+  mv "$PGDATA" "$BACKUP_DIR"
+  sudo -u postgres repmgr -f "$REPMGR_CONF" -h "$CLONE_HOST" -U repmgr -d repmgr standby clone -F
+  systemctl start "$PGSERVICE"
+  wait_for_postgres_ready || { echo "[ERROR] PG failed after clone"; exit 1; }
+  sudo -u postgres repmgr -f "$REPMGR_CONF" standby register -F
+  echo "[SUCCESS] Standby re-cloned and registered."
+}
+
+# ------------------ Main Logic ------------------ #
+
+# 1. Check if node is already the Primary
+is_primary=$(sudo -u postgres repmgr -f "$REPMGR_CONF" cluster show | awk -v node="$NODE_NAME" 'BEGIN {FS="|"} $2 ~ node && $3 ~ /primary/ {print "yes"}')
+if [[ "${is_primary:-no}" == "yes" ]]; then
+  echo "[INFO] Node '$NODE_NAME' is primary. No action needed."
+  exit 0
+fi
+
+# 2. Check current status
+node_status=$(get_cluster_status)
+if [[ "$node_status" == "running" ]]; then
+  echo "[INFO] Node '$NODE_NAME' is already active. Nothing to do."
+  exit 0
+fi
+
+# 3. Try to rejoin (rewind) first
+if try_rejoin; then
+  exit 0
+fi
+
+# 4. Final Fallback
+do_clone
+exit 0
+------------------------
+Configuring above as service and timer service to init at boot
+
+/etc/systemd/system/repmgr-auto-rejoin.timer
+
+[Unit]
+Description=Run repmgr auto-rejoin every 1 minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+--------------------------------
+/etc/systemd/system/repmgr-auto-rejoin.service
+
+[Unit]
+Description=Repmgr Auto Rejoin or Re-Clone
+After=network.target
+Requires=network.target
+
+[Service]
+Type=oneshot
+Environment="DRYRUN=false"
+ExecStart=/usr/local/bin/repmgr-auto-rejoin.sh
+
+----> systemctl daemon-reload
+----> systemctl start repmgr-auto-rejoin.timer
+_________________________________________________________________________________________________________________________________________________________________
+
+# 🧪 Failover Testing
+
+Simulate primary crash:
+
+```
+systemctl stop postgresql
+```
+
+Result:
+
+✔ Standby promoted
+✔ VIP switched automatically
+✔ Applications reconnect instantly
+
+---
+
+# 📊 Final Result
+
+A **fully automated PostgreSQL HA cluster** with:
+
+• streaming replication
+• automatic failover
+• VIP failover routing
+• automatic node recovery
+
+---
+
+💡 **Key Lesson**
+
+High availability isn’t just about failover.
+
+Real resilience requires:
+
+• failover
+• recovery automation
+• node rejoin
+• WAL safety
+
+---
+
