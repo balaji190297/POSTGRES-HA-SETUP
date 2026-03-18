@@ -1,0 +1,12 @@
+/etc/systemd/system/repmgr-auto-rejoin.timer
+
+[Unit]
+Description=Run repmgr auto-rejoin every 1 minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
