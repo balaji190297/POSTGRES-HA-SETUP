@@ -1,0 +1,11 @@
+/etc/systemd/system/repmgr-auto-rejoin.service
+
+[Unit]
+Description=Repmgr Auto Rejoin or Re-Clone
+After=network.target
+Requires=network.target
+
+[Service]
+Type=oneshot
+Environment="DRYRUN=false"
+ExecStart=/usr/local/bin/repmgr-auto-rejoin.sh
